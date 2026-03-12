@@ -17,7 +17,7 @@
   // ═══════════════════════════════════════════════════════════════
   // CONFIGURACIÓN — Reemplaza con tu Client ID de Google OAuth 2.0
   // ═══════════════════════════════════════════════════════════════
-  const CLIENT_ID = '15658888253-789dc881a65ej8rfolj73bols7hpelvn.apps.googleusercontent.com';
+  const CLIENT_ID = '237994176618-1su1jp02c4qhaf91bvq1tol4fhqg2v6i.apps.googleusercontent.com';
 
   // ═══════════════════════════════════════════════════════════════
   // CONSTANTES (no cambiar)
@@ -61,13 +61,26 @@
     localStorage.setItem(LS.lastModified, new Date().toISOString());
   }
 
+  /** Recoge todas las claves moment_* del localStorage en un objeto plano. */
+  function _collectMoments() {
+    const moments = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith('moment_')) continue;
+      try { moments[k] = JSON.parse(localStorage.getItem(k)); }
+      catch { moments[k] = localStorage.getItem(k); }
+    }
+    return moments;
+  }
+
   function getAllLocal() {
     return {
-      version:       2,
+      version:       3,
       lastModified:  getLastModified(),
       rutina_v2:     tryParse('rutina_v2',     []),
-      proyecto_v1:   tryParse('proyecto_v1',   {}),
+      proyecto_v2:   tryParse('proyecto_v2',   {}),   // v2: nuevo módulo de proyectos
       wr_history_v1: tryParse('wr_history_v1', []),
+      moments:       _collectMoments(),               // notas de mañana/mediodía/noche/espiral
     };
   }
 
@@ -75,12 +88,27 @@
     if (Array.isArray(data.rutina_v2)) {
       localStorage.setItem('rutina_v2', JSON.stringify(data.rutina_v2));
     }
-    if (data.proyecto_v1 && typeof data.proyecto_v1 === 'object') {
-      localStorage.setItem('proyecto_v1', JSON.stringify(data.proyecto_v1));
+
+    // proyecto_v2 (nuevo). Si el archivo de Drive era antiguo y tenía proyecto_v1,
+    // lo migramos automáticamente a proyecto_v2.
+    if (data.proyecto_v2 && typeof data.proyecto_v2 === 'object') {
+      localStorage.setItem('proyecto_v2', JSON.stringify(data.proyecto_v2));
+    } else if (data.proyecto_v1 && typeof data.proyecto_v1 === 'object') {
+      localStorage.setItem('proyecto_v2', JSON.stringify(data.proyecto_v1));
     }
+
     if (Array.isArray(data.wr_history_v1)) {
       localStorage.setItem('wr_history_v1', JSON.stringify(data.wr_history_v1));
     }
+
+    // Restaurar todas las notas de momento (moment_*)
+    if (data.moments && typeof data.moments === 'object') {
+      for (const [k, v] of Object.entries(data.moments)) {
+        if (!k.startsWith('moment_') || v == null) continue;
+        localStorage.setItem(k, typeof v === 'string' ? v : JSON.stringify(v));
+      }
+    }
+
     // Actualizar timestamp local con el del dato ganador
     if (data.lastModified) {
       localStorage.setItem(LS.lastModified, data.lastModified);
@@ -103,19 +131,20 @@
   /**
    * Estrategia de merge:
    *  - Gana el lado con lastModified más reciente.
-   *  - Las entradas del diario se unifican por ID para no perder nada.
-   *  - proyecto_v1 y wr_history_v1 se toman del lado ganador sin merge granular.
+   *  - rutina_v2: merge por ID (union, gana el más reciente por dateISO).
+   *  - moments:   merge por clave de fecha (union, gana el más completo para igual día).
+   *  - proyecto_v2 y wr_history_v1: last-write-wins del lado ganador.
    */
   function resolveConflict(local, drive) {
-    const lt = new Date(local.lastModified  || 0).getTime();
-    const dt = new Date(drive.lastModified  || 0).getTime();
+    const lt = new Date(local.lastModified || 0).getTime();
+    const dt = new Date(drive.lastModified || 0).getTime();
 
     if (lt >= dt) {
       // Local es igual o más reciente → subir a Drive
       return { winner: local, shouldUpload: true };
     }
 
-    // Drive es más reciente → merge de entradas del diario, resto de Drive
+    // Drive es más reciente — merge granular de entradas y momentos
     const byId = {};
     for (const e of [...(drive.rutina_v2 || []), ...(local.rutina_v2 || [])]) {
       if (!e?.id) continue;
@@ -123,11 +152,25 @@
         byId[e.id] = e;
       }
     }
+
+    // Merge de moments: union de fechas; para la misma fecha, gana el más largo (más contenido)
+    const mergedMoments = { ...(drive.moments || {}) };
+    for (const [k, localVal] of Object.entries(local.moments || {})) {
+      if (!mergedMoments[k]) {
+        mergedMoments[k] = localVal;
+      } else {
+        const driveLen = JSON.stringify(mergedMoments[k] ?? '').length;
+        const localLen = JSON.stringify(localVal ?? '').length;
+        if (localLen > driveLen) mergedMoments[k] = localVal;
+      }
+    }
+
     const merged = {
       ...drive,
       rutina_v2: Object.values(byId).sort((a, b) =>
         new Date(a.dateISO || 0) - new Date(b.dateISO || 0)
       ),
+      moments: mergedMoments,
     };
     return { winner: merged, shouldUpload: false };
   }
@@ -478,15 +521,26 @@
   // ═══════════════════════════════════════════════════════════════
 
   function _patchSaves() {
-    ['saveEntries', 'saveProjData', 'saveWrHistory'].forEach(name => {
+    // Funciones que guardan vía localStorage indirectamente
+    ['saveEntries', 'saveProjData', 'saveWrHistory', 'saveMomentNotes'].forEach(name => {
       const orig = window[name];
       if (typeof orig !== 'function') return;
       window[name] = function (...args) {
         orig.apply(this, args);
-        touchLastModified(); // registra que hay cambios locales
+        touchLastModified();
         _scheduleSync();
       };
     });
+
+    // autosaveMoment escribe directamente a localStorage (sin función de guardado)
+    const origAuto = window.autosaveMoment;
+    if (typeof origAuto === 'function') {
+      window.autosaveMoment = function (...args) {
+        origAuto.apply(this, args);
+        touchLastModified();
+        _scheduleSync();
+      };
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -526,8 +580,10 @@
     // poner un timestamp reciente para que los datos existentes se suban a Drive.
     if (!localStorage.getItem(LS.lastModified)) {
       const hasDiaryData = tryParse('rutina_v2', []).length > 0
+                        || Object.keys(tryParse('proyecto_v2', {})).length > 0
                         || Object.keys(tryParse('proyecto_v1', {})).length > 0;
       if (hasDiaryData) {
+        // Marca un timestamp reciente para que los datos existentes se suban a Drive
         localStorage.setItem(LS.lastModified, new Date(Date.now() - 1000).toISOString());
       }
     }
