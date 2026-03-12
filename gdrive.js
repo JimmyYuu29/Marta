@@ -17,7 +17,7 @@
   // ═══════════════════════════════════════════════════════════════
   // CONFIGURACIÓN — Reemplaza con tu Client ID de Google OAuth 2.0
   // ═══════════════════════════════════════════════════════════════
-  const CLIENT_ID = 'YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com';
+  const CLIENT_ID = '15658888253-789dc881a65ej8rfolj73bols7hpelvn.apps.googleusercontent.com';
 
   // ═══════════════════════════════════════════════════════════════
   // CONSTANTES (no cambiar)
